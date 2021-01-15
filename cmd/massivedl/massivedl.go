@@ -9,9 +9,11 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -34,13 +36,14 @@ type dataEntry struct {
 
 // cmdLineParams - Configuration struct
 type cmdLineParams struct {
-	ConcurrentRequests int     `json:"concurrentRequests"`
-	EntriesFilepath    string  `json:"entriesFilepath"`
-	SkippedLines       int     `json:"skippedLines"`
-	OutputDir          string  `json:"outputDir"`
-	MaxRetries         int     `json:"maxRetries"`
-	Offset             int     `json:"offset"`
-	DelayPerRequest    float64 `json:"delayPerRequest"`
+	ConcurrentRequests int           `json:"concurrentRequests"`
+	EntriesFilepath    string        `json:"entriesFilepath"`
+	OutputDir          string        `json:"outputDir"`
+	MaxRetries         int           `json:"maxRetries"`
+	Offset             int           `json:"offset"`
+	DelayPerRequest    time.Duration `json:"delayPerRequest"`
+	UserAgent          string        `json:"userAgent"`
+	SkipExisting       bool          `json:"skipExisting"`
 }
 
 // saveEntry - data required for saving/loading progress
@@ -54,57 +57,37 @@ var stats statistics.Statistics
 var p cmdLineParams
 var stopWorking bool // workers check this flag before taking a job
 
-// loads data entries from a csv file.
-// csv file entries be (output name, url)
-// check examples/ for example .csv files
-// @param filename - The full path of the .csv file to load
-// @param offset - Number of lines to skip from the beginning
-//                       of the csv file
-func parseDownloadsFromCsv(filename string, offset int) []dataEntry {
-	var entries []dataEntry
-
-	file, err := os.Open(filename)
+func loadURLs(urlFile string) ([]*url.URL, error) {
+	fh, err := os.Open(urlFile)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer func() {
-		if err = file.Close(); err != nil {
-			log.Printf("error closing file: %v\n", err)
-		}
-	}()
 
-	scanner := bufio.NewScanner(file)
-
-	/* pass the skipped lines */
-	for i := 0; i < offset; i++ {
-		scanner.Scan()
-	}
+	urls := make([]*url.URL, 0)
+	scanner := bufio.NewScanner(fh)
 	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), ",", 2)
-		if len(parts) != 2 {
-			continue
+		line := strings.TrimSpace(scanner.Text())
+		u, err := url.Parse(line)
+		if err != nil {
+			log.Printf("%s: %s\n", line, err)
 		}
-		entries = append(entries, dataEntry{
-			strings.Trim(parts[0], " "),
-			strings.Trim(parts[1], " "),
-		})
+
+		urls = append(urls, u)
 	}
 
-	if err = scanner.Err(); err != nil {
-		log.Fatal(err)
-	}
-	return entries
+	return urls, nil
 }
 
 func parseCmdLineParams() {
-	var version = flag.Bool("v", false, "Print version info")
-	var loadedFile = flag.String("l", "", "Saved progress file to load")
-	var entriesFilepath = flag.String("i", "", "Input downloads csv file")
-	var concurrentRequests = flag.Int("p", 10, "Number of parallel requests")
-	var skippedLines = flag.Int("s", 1, "Number of skipped lines from input")
-	var outputDir = flag.String("o", "downloads", "Directory to place downloads")
-	var maxRetries = flag.Int("r", 3, "Number of retries for failed downloads")
-	var delayPerRequest = flag.Float64("d", 1, "Delay per request in seconds")
+	var version = flag.Bool("version", false, "Print version info")
+	var loadedFile = flag.String("load", "", "Saved progress file to load")
+	var entriesFilepath = flag.String("urlfile", "", "Input downloads csv file")
+	var concurrentRequests = flag.Int("workers", 20, "Number of parallel requests")
+	var outputDir = flag.String("outdir", "downloads", "Directory to place downloads")
+	var maxRetries = flag.Int("retries", 3, "Number of retries for failed downloads")
+	var delayPerRequest = flag.Duration("delay", 1*time.Second, "Delay per request")
+	var userAgent = flag.String("useragent", "massivedl/1.0", "User Agent to use")
+	var skipExisting = flag.Bool("skip-existing", true, "Don't load files that already exist locally")
 	flag.Parse()
 
 	if *version || *entriesFilepath == "" {
@@ -117,10 +100,11 @@ func parseCmdLineParams() {
 	} else {
 		p.EntriesFilepath = *entriesFilepath
 		p.ConcurrentRequests = *concurrentRequests
-		p.SkippedLines = *skippedLines
 		p.OutputDir = *outputDir
 		p.MaxRetries = *maxRetries
 		p.DelayPerRequest = *delayPerRequest
+		p.UserAgent = *userAgent
+		p.SkipExisting = *skipExisting
 	}
 }
 
@@ -228,7 +212,7 @@ func registerSignalHandlers() {
 
 // Downloads a file on the specified url
 // @param filepath - The file where the output will be saved
-func download(url, filepath string, maxRetries int) logging.LogEntry {
+func download(url, filepath string, maxRetries int, userAgent string) logging.LogEntry {
 	totalTries := 0
 	logRow := logging.LogEntry{Url: url, Name: filepath, Result: false, NBytes: 0, Duration: 0}
 	var response *http.Response
@@ -247,7 +231,17 @@ func download(url, filepath string, maxRetries int) logging.LogEntry {
 			return logRow
 		}
 
-		response, err = http.Get(url)
+		client := &http.Client{}
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			log.Println(err)
+			break
+		}
+
+		req.Header.Set("User-Agent", userAgent)
+
+		response, err = client.Do(req)
 		if err != nil {
 			log.Println("[RETRY]", totalTries, url, filepath)
 			totalTries++
@@ -290,18 +284,24 @@ func download(url, filepath string, maxRetries int) logging.LogEntry {
 	return logRow
 }
 
-func worker(_ int, jobs <-chan dataEntry, results chan<- logging.LogEntry) {
+func worker(_ int, jobs <-chan *url.URL, results chan<- logging.LogEntry, skipExisting bool) {
 	for j := range jobs {
 		if stopWorking {
 			break
 		}
 
-		res := download(j.url, path.Join(p.OutputDir, j.name), p.MaxRetries)
+		outFile := path.Join(p.OutputDir, filepath.Base(j.Path))
+		_, err := os.Stat(outFile)
+		if err == nil && skipExisting {
+			results <- logging.LogEntry{Url: j.String(), Name: outFile, Result: true, NBytes: 0, Duration: 0}
+			continue
+		}
+		res := download(j.String(), outFile, p.MaxRetries, p.UserAgent)
 		stats.Update(res)
 		res.Print()
 		results <- res
 
-		time.Sleep(timeutil.FloatToDuration(p.DelayPerRequest, "s"))
+		time.Sleep(p.DelayPerRequest)
 	}
 }
 
@@ -317,8 +317,11 @@ func run(_ cmdLineParams) {
 	}
 
 	// load urls - entries to download
-	entries := parseDownloadsFromCsv(p.EntriesFilepath, p.SkippedLines+p.Offset)
-	stats.TotalDownloads = len(entries)
+	urls, err := loadURLs(p.EntriesFilepath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	stats.TotalDownloads = len(urls)
 
 	// set number of workers from command line parameters
 	numWorkers := p.ConcurrentRequests
@@ -338,7 +341,7 @@ func run(_ cmdLineParams) {
 	log.SetOutput(f)
 
 	// create jobs channel
-	jobs := make(chan dataEntry, stats.TotalDownloads)
+	jobs := make(chan *url.URL)
 
 	// create results channel
 	results := make(chan logging.LogEntry, stats.TotalDownloads)
@@ -357,12 +360,12 @@ func run(_ cmdLineParams) {
 
 	// init worker goroutines
 	for i := 0; i < numWorkers; i++ {
-		go worker(i, jobs, results)
+		go worker(i, jobs, results, p.SkipExisting)
 	}
 
 	// start sending jobs
 	for i := 0; i < stats.TotalDownloads; i++ {
-		jobs <- entries[i]
+		jobs <- urls[i]
 	}
 	close(jobs)
 
