@@ -28,6 +28,7 @@ massivedl -workers 10 -urlfile urls.txt -outdir downloads
 -useragent <str>                     : Use this useragent      
 -delay <duration>                    : Sleep this long between requests (e.g. 100ms or 2s)
 -retries <int>                       : Retry loading a URL this often
+-checksum-path                       : use the URL's SHA256 checksum as filename 
 ```
 
 ### Stop and continue later
