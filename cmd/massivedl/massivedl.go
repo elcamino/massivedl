@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -44,6 +45,7 @@ type cmdLineParams struct {
 	DelayPerRequest    time.Duration `json:"delayPerRequest"`
 	UserAgent          string        `json:"userAgent"`
 	SkipExisting       bool          `json:"skipExisting"`
+	UseChecksumAsPath  bool          `json:"useChecksumAsPath"`
 }
 
 // saveEntry - data required for saving/loading progress
@@ -86,8 +88,9 @@ func parseCmdLineParams() {
 	var outputDir = flag.String("outdir", "downloads", "Directory to place downloads")
 	var maxRetries = flag.Int("retries", 3, "Number of retries for failed downloads")
 	var delayPerRequest = flag.Duration("delay", 1*time.Second, "Delay per request")
-	var userAgent = flag.String("useragent", "massivedl/1.0", "User Agent to use")
+	var userAgent = flag.String("useragent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.2 Safari/605.1.15", "User Agent to use")
 	var skipExisting = flag.Bool("skip-existing", true, "Don't load files that already exist locally")
+	var useChecksumAsPath = flag.Bool("checksum-path", false, "Use the SHA checksum of the URL as file name locally")
 	flag.Parse()
 
 	if *version || *entriesFilepath == "" {
@@ -105,6 +108,7 @@ func parseCmdLineParams() {
 		p.DelayPerRequest = *delayPerRequest
 		p.UserAgent = *userAgent
 		p.SkipExisting = *skipExisting
+		p.UseChecksumAsPath = *useChecksumAsPath
 	}
 }
 
@@ -221,6 +225,10 @@ func download(url, filepath string, maxRetries int, userAgent string) logging.Lo
 
 	startTime := time.Now()
 	defer func() {
+		if response == nil {
+			return
+		}
+
 		if err = response.Body.Close(); err != nil {
 			log.Printf("error closing response body: %v", err)
 		}
@@ -284,15 +292,18 @@ func download(url, filepath string, maxRetries int, userAgent string) logging.Lo
 	return logRow
 }
 
-func worker(_ int, jobs <-chan *url.URL, results chan<- logging.LogEntry, skipExisting bool) {
+func worker(_ int, jobs <-chan *url.URL, results chan<- logging.LogEntry) {
 	for j := range jobs {
 		if stopWorking {
 			break
 		}
 
 		outFile := path.Join(p.OutputDir, filepath.Base(j.Path))
+		if p.UseChecksumAsPath {
+			outFile = path.Join(p.OutputDir, fmt.Sprintf("%x", sha256.Sum256([]byte(j.String()))))
+		}
 		_, err := os.Stat(outFile)
-		if err == nil && skipExisting {
+		if err == nil && p.SkipExisting {
 			results <- logging.LogEntry{Url: j.String(), Name: outFile, Result: true, NBytes: 0, Duration: 0}
 			continue
 		}
@@ -360,7 +371,7 @@ func run(_ cmdLineParams) {
 
 	// init worker goroutines
 	for i := 0; i < numWorkers; i++ {
-		go worker(i, jobs, results, p.SkipExisting)
+		go worker(i, jobs, results)
 	}
 
 	// start sending jobs
